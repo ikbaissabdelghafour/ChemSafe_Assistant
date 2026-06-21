@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.loader import DataLoader
-from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score, precision_recall_curve
 
 from src.model.loss import MaskedBCEWithLogitsLoss
 
@@ -44,6 +44,7 @@ class Trainer:
         patience: int = 15,
         save_path: str = "saved_models/gnn_tox21.pt",
         device: str = None,
+        pos_weight: torch.Tensor = None,
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -56,7 +57,10 @@ class Trainer:
         self.val_loader = DataLoader(val_graphs, batch_size=batch_size, shuffle=False, pin_memory=True)
 
         # Loss, Optimizer, Scheduler
-        self.criterion = MaskedBCEWithLogitsLoss(reduction="mean")
+        if pos_weight is not None:
+            pos_weight = pos_weight.to(self.device)
+            
+        self.criterion = MaskedBCEWithLogitsLoss(reduction="mean", pos_weight=pos_weight)
         self.optimizer = Adam(self.model.parameters(), lr=lr)
         self.scheduler = ReduceLROnPlateau(
             self.optimizer, mode="min", factor=0.5, patience=5, verbose=True
@@ -128,6 +132,7 @@ class Trainer:
         per_task_prec = []
         per_task_rec = []
         per_task_f1 = []
+        self.current_thresholds = []
         for task_idx in range(12):
             y_true = all_targets[:, task_idx]
             y_score = all_preds[:, task_idx]
@@ -136,7 +141,6 @@ class Trainer:
             valid_mask = ~np.isnan(y_true)
             y_true_valid = y_true[valid_mask]
             y_score_valid = y_score[valid_mask]
-            y_pred_valid = (y_score_valid > 0.5).astype(int)
 
             # ROC-AUC requires both classes to be present
             if len(np.unique(y_true_valid)) < 2:
@@ -145,7 +149,15 @@ class Trainer:
                 per_task_prec.append(float("nan"))
                 per_task_rec.append(float("nan"))
                 per_task_f1.append(float("nan"))
+                self.current_thresholds.append(0.5)
             else:
+                precisions, recalls, thresholds = precision_recall_curve(y_true_valid, y_score_valid)
+                f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+                best_idx = np.argmax(f1_scores)
+                best_thresh = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
+                
+                y_pred_valid = (y_score_valid > best_thresh).astype(int)
+
                 auc = roc_auc_score(y_true_valid, y_score_valid)
                 acc = accuracy_score(y_true_valid, y_pred_valid)
                 prec = precision_score(y_true_valid, y_pred_valid, zero_division=0)
@@ -157,6 +169,7 @@ class Trainer:
                 per_task_prec.append(prec)
                 per_task_rec.append(rec)
                 per_task_f1.append(f1)
+                self.current_thresholds.append(best_thresh)
 
         # Mean AUC across tasks (ignoring NaN tasks)
         valid_aucs = [a for a in per_task_auc if not np.isnan(a)]
@@ -211,6 +224,7 @@ class Trainer:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 epochs_no_improve = 0
+                self.best_thresholds = list(self.current_thresholds)
                 self._save_checkpoint(epoch, val_loss, val_auc)
                 print(f"         > Best model saved (val_loss={val_loss:.4f})")
             else:
@@ -231,6 +245,7 @@ class Trainer:
             "val_precs": self.val_precs,
             "val_recs": self.val_recs,
             "val_f1s": self.val_f1s,
+            "best_thresholds": self.best_thresholds,
         }
 
     def _save_checkpoint(self, epoch: int, val_loss: float, val_auc: float):
@@ -243,6 +258,7 @@ class Trainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "val_loss": val_loss,
                 "val_auc": val_auc,
+                "best_thresholds": self.best_thresholds,
             },
             self.save_path,
         )

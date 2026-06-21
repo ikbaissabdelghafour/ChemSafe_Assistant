@@ -48,7 +48,21 @@ def main():
     NUM_NODE_FEATURES = train_graphs[0].x.shape[1]
     print(f'Node feature dim: {NUM_NODE_FEATURES}')
 
-    print("\n--- 2. Initializing Model ---")
+    print("\n--- 2. Computing Class Weights ---")
+    pos_counts = torch.zeros(12)
+    neg_counts = torch.zeros(12)
+    for g in train_graphs:
+        y = g.y.view(-1)
+        mask = ~torch.isnan(y)
+        pos_counts += (y == 1.0) * mask
+        neg_counts += (y == 0.0) * mask
+        
+    pos_weight = neg_counts / torch.clamp(pos_counts, min=1.0)
+    print("Positive class weights per task:")
+    for i, name in enumerate(TOX21_LABELS):
+        print(f"  {name:<20}: {pos_weight[i]:.2f}")
+
+    print("\n--- 3. Initializing Model ---")
     model = Tox21GNN(
         num_node_features=NUM_NODE_FEATURES,
         hidden_dim=128,
@@ -62,7 +76,7 @@ def main():
     print(f'Total parameters: {total_params:,}')
     print(f'Trainable parameters: {trainable_params:,}')
 
-    print("\n--- 3. Starting Training ---")
+    print("\n--- 4. Starting Training ---")
     
     # Create attempt directory
     train_history_dir = os.path.join(PROJECT_ROOT, 'train_history')
@@ -86,7 +100,8 @@ def main():
         epochs=100,
         patience=15,
         save_path=SAVE_PATH,
-        device=device
+        device=device,
+        pos_weight=pos_weight
     )
 
     start_time = time.time()
@@ -104,7 +119,7 @@ def main():
         json.dump(history, f, indent=4)
     print(f'Metrics data saved to {metrics_path}')
 
-    print("\n--- 4. Plotting Training Metrics ---")
+    print("\n--- 5. Plotting Training Metrics ---")
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     axes = axes.flatten()
 
@@ -158,9 +173,10 @@ def main():
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     print(f'Training curves saved to {plot_path}')
 
-    print("\n--- 5. Evaluating on Test Set ---")
+    print("\n--- 6. Evaluating on Test Set ---")
     checkpoint = torch.load(SAVE_PATH)
     model.load_state_dict(checkpoint['model_state_dict'])
+    best_thresholds = checkpoint.get('best_thresholds', [0.5] * 12)
     model = model.to(device)
     model.eval()
 
@@ -196,7 +212,8 @@ def main():
         if len(np.unique(y_true_v)) < 2:
             print(f'{name:<20} | {"N/A":<10} | {"N/A":<10} | {"N/A":<10} | {"N/A":<10} | {"N/A":<10}')
         else:
-            y_pred_v = (y_score_v > 0.5).astype(int)
+            best_thresh = best_thresholds[i]
+            y_pred_v = (y_score_v > best_thresh).astype(int)
             auc = roc_auc_score(y_true_v, y_score_v)
             acc = accuracy_score(y_true_v, y_pred_v)
             prec = precision_score(y_true_v, y_pred_v, zero_division=0)

@@ -24,9 +24,10 @@ class MaskedBCEWithLogitsLoss(nn.Module):
         reduction: How to reduce the valid losses ('mean' or 'sum').
     """
 
-    def __init__(self, reduction: str = "mean"):
+    def __init__(self, reduction: str = "mean", pos_weight: torch.Tensor = None):
         super(MaskedBCEWithLogitsLoss, self).__init__()
         self.reduction = reduction
+        self.pos_weight = pos_weight
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -53,7 +54,7 @@ class MaskedBCEWithLogitsLoss(nn.Module):
 
         # Compute element-wise BCE loss (no reduction yet)
         bce = nn.functional.binary_cross_entropy_with_logits(
-            logits, safe_targets, reduction="none"
+            logits, safe_targets, reduction="none", pos_weight=self.pos_weight
         )
 
         # Zero out loss for missing labels
