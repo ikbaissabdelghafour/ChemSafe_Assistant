@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.loader import DataLoader
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
 
 from src.model.loss import MaskedBCEWithLogitsLoss
 
@@ -52,8 +52,8 @@ class Trainer:
         self.save_path = save_path
 
         # DataLoaders
-        self.train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
-        self.val_loader = DataLoader(val_graphs, batch_size=batch_size, shuffle=False)
+        self.train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True, pin_memory=True)
+        self.val_loader = DataLoader(val_graphs, batch_size=batch_size, shuffle=False, pin_memory=True)
 
         # Loss, Optimizer, Scheduler
         self.criterion = MaskedBCEWithLogitsLoss(reduction="mean")
@@ -66,6 +66,10 @@ class Trainer:
         self.train_losses = []
         self.val_losses = []
         self.val_aucs = []
+        self.val_accs = []
+        self.val_precs = []
+        self.val_recs = []
+        self.val_f1s = []
 
     def _train_one_epoch(self) -> float:
         """Run one training epoch. Returns average training loss."""
@@ -120,6 +124,10 @@ class Trainer:
         all_targets = np.concatenate(all_targets, axis=0)
 
         per_task_auc = []
+        per_task_acc = []
+        per_task_prec = []
+        per_task_rec = []
+        per_task_f1 = []
         for task_idx in range(12):
             y_true = all_targets[:, task_idx]
             y_score = all_preds[:, task_idx]
@@ -128,19 +136,42 @@ class Trainer:
             valid_mask = ~np.isnan(y_true)
             y_true_valid = y_true[valid_mask]
             y_score_valid = y_score[valid_mask]
+            y_pred_valid = (y_score_valid > 0.5).astype(int)
 
             # ROC-AUC requires both classes to be present
             if len(np.unique(y_true_valid)) < 2:
                 per_task_auc.append(float("nan"))
+                per_task_acc.append(float("nan"))
+                per_task_prec.append(float("nan"))
+                per_task_rec.append(float("nan"))
+                per_task_f1.append(float("nan"))
             else:
                 auc = roc_auc_score(y_true_valid, y_score_valid)
+                acc = accuracy_score(y_true_valid, y_pred_valid)
+                prec = precision_score(y_true_valid, y_pred_valid, zero_division=0)
+                rec = recall_score(y_true_valid, y_pred_valid, zero_division=0)
+                f1 = f1_score(y_true_valid, y_pred_valid, zero_division=0)
+                
                 per_task_auc.append(auc)
+                per_task_acc.append(acc)
+                per_task_prec.append(prec)
+                per_task_rec.append(rec)
+                per_task_f1.append(f1)
 
         # Mean AUC across tasks (ignoring NaN tasks)
         valid_aucs = [a for a in per_task_auc if not np.isnan(a)]
+        valid_accs = [a for a in per_task_acc if not np.isnan(a)]
+        valid_precs = [a for a in per_task_prec if not np.isnan(a)]
+        valid_recs = [a for a in per_task_rec if not np.isnan(a)]
+        valid_f1s = [a for a in per_task_f1 if not np.isnan(a)]
+        
         mean_auc = np.mean(valid_aucs) if len(valid_aucs) > 0 else 0.0
+        mean_acc = np.mean(valid_accs) if len(valid_accs) > 0 else 0.0
+        mean_prec = np.mean(valid_precs) if len(valid_precs) > 0 else 0.0
+        mean_rec = np.mean(valid_recs) if len(valid_recs) > 0 else 0.0
+        mean_f1 = np.mean(valid_f1s) if len(valid_f1s) > 0 else 0.0
 
-        return avg_loss, mean_auc, per_task_auc
+        return avg_loss, mean_auc, mean_acc, mean_prec, mean_rec, mean_f1
 
     def train(self) -> dict:
         """
@@ -153,23 +184,27 @@ class Trainer:
         epochs_no_improve = 0
 
         print(f"Training on {self.device} for up to {self.epochs} epochs...")
-        print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>9} | {'Val AUC':>9} | {'LR':>10}")
-        print("-" * 60)
+        print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>9} | {'Val AUC':>9} | {'Val F1':>9} | {'LR':>10}")
+        print("-" * 72)
 
         for epoch in range(1, self.epochs + 1):
             train_loss = self._train_one_epoch()
-            val_loss, val_auc, per_task_auc = self._validate()
+            val_loss, val_auc, val_acc, val_prec, val_rec, val_f1 = self._validate()
 
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
             self.val_aucs.append(val_auc)
+            self.val_accs.append(val_acc)
+            self.val_precs.append(val_prec)
+            self.val_recs.append(val_rec)
+            self.val_f1s.append(val_f1)
 
             # Step the LR scheduler
             self.scheduler.step(val_loss)
             current_lr = self.optimizer.param_groups[0]["lr"]
 
             print(
-                f"{epoch:>6} | {train_loss:>11.4f} | {val_loss:>9.4f} | {val_auc:>9.4f} | {current_lr:>10.6f}"
+                f"{epoch:>6} | {train_loss:>11.4f} | {val_loss:>9.4f} | {val_auc:>9.4f} | {val_f1:>9.4f} | {current_lr:>10.6f}"
             )
 
             # Checkpoint best model
@@ -177,21 +212,25 @@ class Trainer:
                 best_val_loss = val_loss
                 epochs_no_improve = 0
                 self._save_checkpoint(epoch, val_loss, val_auc)
-                print(f"         ✓ Best model saved (val_loss={val_loss:.4f})")
+                print(f"         > Best model saved (val_loss={val_loss:.4f})")
             else:
                 epochs_no_improve += 1
 
             # Early stopping
             if epochs_no_improve >= self.patience:
-                print(f"\n⛔ Early stopping triggered after {epoch} epochs (patience={self.patience})")
+                print(f"\n! Early stopping triggered after {epoch} epochs (patience={self.patience})")
                 break
 
-        print(f"\n✅ Training complete. Best val_loss={best_val_loss:.4f}")
+        print(f"\n* Training complete. Best val_loss={best_val_loss:.4f}")
 
         return {
             "train_losses": self.train_losses,
             "val_losses": self.val_losses,
             "val_aucs": self.val_aucs,
+            "val_accs": self.val_accs,
+            "val_precs": self.val_precs,
+            "val_recs": self.val_recs,
+            "val_f1s": self.val_f1s,
         }
 
     def _save_checkpoint(self, epoch: int, val_loss: float, val_auc: float):
