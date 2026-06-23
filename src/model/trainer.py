@@ -10,11 +10,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.loader import DataLoader
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score, precision_recall_curve
 
-from src.model.loss import MaskedBCEWithLogitsLoss
+from src.model.loss import MaskedBCEWithLogitsLoss, MaskedFocalLoss
 
 
 class Trainer:
@@ -61,9 +61,9 @@ class Trainer:
             pos_weight = pos_weight.to(self.device)
             
         self.criterion = MaskedBCEWithLogitsLoss(reduction="mean", pos_weight=pos_weight)
-        self.optimizer = Adam(self.model.parameters(), lr=lr)
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer, mode="min", factor=0.5, patience=5, verbose=True
+        self.optimizer = Adam(self.model.parameters(), lr=lr, weight_decay=1e-4)
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer, T_max=self.epochs, eta_min=1e-6
         )
 
         # Tracking
@@ -152,8 +152,10 @@ class Trainer:
                 self.current_thresholds.append(0.5)
             else:
                 precisions, recalls, thresholds = precision_recall_curve(y_true_valid, y_score_valid)
-                f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
-                best_idx = np.argmax(f1_scores)
+                # Use F1.5 score to prioritize Recall over Precision, but less extremely than F2
+                beta = 1.5
+                f_beta_scores = (1 + beta**2) * (precisions * recalls) / ((beta**2 * precisions) + recalls + 1e-8)
+                best_idx = np.argmax(f_beta_scores)
                 best_thresh = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
                 
                 y_pred_valid = (y_score_valid > best_thresh).astype(int)
@@ -213,7 +215,7 @@ class Trainer:
             self.val_f1s.append(val_f1)
 
             # Step the LR scheduler
-            self.scheduler.step(val_loss)
+            self.scheduler.step()
             current_lr = self.optimizer.param_groups[0]["lr"]
 
             print(

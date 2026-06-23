@@ -98,7 +98,7 @@ def main():
         lr=1e-3,
         batch_size=1024,
         epochs=100,
-        patience=15,
+        patience=100,
         save_path=SAVE_PATH,
         device=device,
         pos_weight=pos_weight

@@ -5,15 +5,17 @@ Implements Graph Neural Network architecture for multi-label toxicity prediction
 on the Tox21 dataset (12 endpoints).
 
 Architecture:
-    - 3 GCNConv message passing layers with BatchNorm and Dropout
-    - Global pooling: mean + max concatenation
-    - MLP head: 256 → 128 → 12 (raw logits)
+    - Node encoder & Edge encoder
+    - 5 GINEConv message passing layers with edge features, BatchNorm and Dropout
+    - Jumping Knowledge: Concatenation of all layers
+    - Global pooling: mean + max concatenation per layer
+    - MLP head: 1280 -> 512 → 256 → 12 (raw logits)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool
+from torch_geometric.nn import GINEConv, GraphNorm, GlobalAttention
 
 
 class Tox21GNN(nn.Module):
@@ -32,33 +34,57 @@ class Tox21GNN(nn.Module):
         num_node_features: int,
         hidden_dim: int = 128,
         num_tasks: int = 12,
-        dropout: float = 0.3,
+        dropout: float = 0.4,
     ):
         super(Tox21GNN, self).__init__()
 
         self.num_tasks = num_tasks
         self.dropout = dropout
 
-        # ── Message Passing Layers ──────────────────────────────────────
-        self.conv1 = GCNConv(num_node_features, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        # ── Encoders ────────────────────────────────────────────────────
+        self.node_encoder = nn.Linear(num_node_features, hidden_dim)
+        # graph_builder extracts 6 bond features
+        self.edge_encoder = nn.Linear(6, hidden_dim)
 
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        # ── Message Passing Layers (GINEConv) ───────────────────────────
+        def create_gine_nn():
+            return nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU()
+            )
 
-        self.conv3 = GCNConv(hidden_dim, hidden_dim)
-        self.bn3 = nn.BatchNorm1d(hidden_dim)
+        self.conv1 = GINEConv(create_gine_nn(), edge_dim=hidden_dim)
+        self.gn1 = GraphNorm(hidden_dim)
+
+        self.conv2 = GINEConv(create_gine_nn(), edge_dim=hidden_dim)
+        self.gn2 = GraphNorm(hidden_dim)
+
+        self.conv3 = GINEConv(create_gine_nn(), edge_dim=hidden_dim)
+        self.gn3 = GraphNorm(hidden_dim)
+
+        # ── Global Attention Pooling ────────────────────────────────────
+        self.pool1 = GlobalAttention(gate_nn=nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.BatchNorm1d(hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1)))
+        self.pool2 = GlobalAttention(gate_nn=nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.BatchNorm1d(hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1)))
+        self.pool3 = GlobalAttention(gate_nn=nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.BatchNorm1d(hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1)))
 
         # ── MLP Prediction Head ─────────────────────────────────────────
-        # Input dim = hidden_dim * 2 because we concatenate mean + max pooling
+        # Jumping Knowledge: we concatenate the attention-pooled representations of all 3 layers
+        # Input dim = hidden_dim * 3 layers
+        jk_dim = hidden_dim * 3
+        
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 256),
+            nn.Linear(jk_dim, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 128),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(128, num_tasks),
+            nn.Linear(256, num_tasks),
         )
 
     def forward(self, data):
@@ -67,37 +93,48 @@ class Tox21GNN(nn.Module):
 
         Args:
             data: PyTorch Geometric Data/Batch object with attributes:
-                  x (node features), edge_index, batch.
+                  x, edge_index, edge_attr, batch.
 
         Returns:
-            logits: Raw (pre-sigmoid) predictions of shape (batch_size, num_tasks).
+            logits: Raw predictions of shape (batch_size, num_tasks).
         """
-        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+
+        x = self.node_encoder(x)
+        edge_attr = self.edge_encoder(edge_attr)
+
+        layer_outputs = []
 
         # ── Layer 1 ────────────────────────────────────────────────────
-        x = self.conv1(x, edge_index)
-        x = self.bn1(x)
-        x = F.relu(x)
+        x = self.conv1(x, edge_index, edge_attr)
+        x = self.gn1(x, batch)
         x = F.dropout(x, p=self.dropout, training=self.training)
+        layer_outputs.append(x)
 
         # ── Layer 2 ────────────────────────────────────────────────────
-        x = self.conv2(x, edge_index)
-        x = self.bn2(x)
-        x = F.relu(x)
+        x = self.conv2(x, edge_index, edge_attr)
+        x = self.gn2(x, batch)
         x = F.dropout(x, p=self.dropout, training=self.training)
+        layer_outputs.append(x)
 
         # ── Layer 3 ────────────────────────────────────────────────────
-        x = self.conv3(x, edge_index)
-        x = self.bn3(x)
-        x = F.relu(x)
+        x = self.conv3(x, edge_index, edge_attr)
+        x = self.gn3(x, batch)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        layer_outputs.append(x)
 
-        # ── Global Pooling (mean + max concatenation) ──────────────────
-        x_mean = global_mean_pool(x, batch)   # (batch_size, hidden_dim)
-        x_max = global_max_pool(x, batch)     # (batch_size, hidden_dim)
-        x = torch.cat([x_mean, x_max], dim=1) # (batch_size, hidden_dim * 2)
+        # ── Jumping Knowledge + Global Attention Pooling ───────────────
+        pooled_outputs = [
+            self.pool1(layer_outputs[0], batch),
+            self.pool2(layer_outputs[1], batch),
+            self.pool3(layer_outputs[2], batch)
+        ]
+
+        # Concatenate all layer poolings
+        x_jk = torch.cat(pooled_outputs, dim=1)
 
         # ── MLP Head ──────────────────────────────────────────────────
-        logits = self.mlp(x)  # (batch_size, num_tasks)
+        logits = self.mlp(x_jk)  
 
         return logits
 
